@@ -62,7 +62,6 @@ def send_telegram_notification(status, old_due, new_due):
 
     text = (
         f"🎉 HidenCloud 续期通知\n\n"
-        f"{status}\n"
         f"👤 账号: {masked_email}\n"
         f"📅 续期前到期：{old_due}\n"
         f"📅 续期后到期：{new_due}\n"
