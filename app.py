@@ -62,6 +62,7 @@ def send_telegram_notification(status, old_due, new_due):
 
     text = (
         f"🎉 HidenCloud 续期通知\n\n"
+        f"{status}\n"
         f"👤 账号: {masked_email}\n"
         f"📅 续期前到期：{old_due}\n"
         f"📅 续期后到期：{new_due}\n"
@@ -312,55 +313,107 @@ def get_due_date(page):
         log(f"❌ 获取Due Date失败: {e}")
     return "未知"
 
-def renew_service(page):
-
+def renew_service(page, server_id=None):
     try:
         log("➡ 进入续期流程...")
         if page.url != SERVICE_URL:
             page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
+        page.wait_for_timeout(2000)
+
+        # 检查是否有限制提示
+        page_text = page.locator("body").inner_text()
+        if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
+            log("⚠️ 未到续期时间，无法续期。")
+            return "NOT_TIME"
 
         log("🖱️ 准备点击 'Renew' 按钮...")
-        renew_btn = page.locator('button:has-text("Renew")')
-        create_btn = page.locator('button:has-text("Create Invoice")')
+
+        # 仅使用真实浏览器点击，不使用 form.submit()
+        renew_btn = page.locator('button:has-text("Renew")').first
+        create_btn = page.locator('button:has-text("Create Invoice")').first
 
         modal_opened = False
+
         for i in range(3):
             try:
+                # 每次尝试前重新确认页面状态
+                handle_cloudflare(page)
+                renew_btn = page.locator('button:has-text("Renew")').first
                 renew_btn.wait_for(state="visible", timeout=10000)
                 renew_btn.scroll_into_view_if_needed()
-                log(f"🖱️ 第 {i+1} 次尝试点击 'Renew'...")
-                renew_btn.click()
+                page.wait_for_timeout(500)
 
-                # 等待一小段时间，检测是否出现“未到续期时间”弹窗
-                time.sleep(2)
-                page_text = page.locator("body").inner_text()
-                if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
-                    log("⚠️ 未到续期时间，无法续期。")
-                    page.screenshot(path="renew_not_allowed.png")
-                    return "NOT_TIME"   # 特殊状态
+                log(f"🖱️ 第 {i + 1} 次尝试点击 'Renew'...")
 
-                log("🖲️ 等待弹窗出现...")
+                # 使用 force click，避免遮挡/可点击区域问题
+                renew_btn.click(force=True)
+
+                # 等待 Modal / Create Invoice
+                log("🖲️ 等待续费弹窗...")
                 try:
+                    create_btn = page.locator('button:has-text("Create Invoice")').first
                     create_btn.wait_for(state="visible", timeout=5000)
                     modal_opened = True
-                    log("✅ 弹窗已成功弹出！")
+                    log("✅ 续费弹窗已成功弹出！")
                     break
-                except:
-                    log("⚠️ 弹窗未出现，可能是点击未响应，准备重试...")
-                    time.sleep(2)
+                except Exception:
+                    # 再检查一次页面文字，避免把 Renewal Restricted 当成普通点击失败
+                    current_text = page.locator("body").inner_text()
+                    if "Renewal Restricted" in current_text or "can only renew" in current_text.lower():
+                        log("⚠️ 未到续期时间，无法续期。")
+                        return "NOT_TIME"
+
+                    log("⚠️ 弹窗未出现，准备重新加载页面后重试...")
+
+                    # 第1、2次失败时重新进入服务页面，再进行下一次点击
+                    if i < 2:
+                        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+                        handle_cloudflare(page)
+                        page.wait_for_timeout(1500)
+
             except Exception as e:
-                log(f"❌ 点击尝试出错: {e}")
+                log(f"❌ 第 {i + 1} 次点击 Renew 出错: {e}")
+                if i < 2:
+                    try:
+                        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+                        handle_cloudflare(page)
+                        page.wait_for_timeout(1500)
+                    except Exception as reload_error:
+                        log(f"⚠️ 重载续费页面失败: {reload_error}")
 
         if not modal_opened:
-            log("❌ 错误：尝试多次后，续费弹窗仍未出现。")
+            log("❌ 错误：3次尝试后，续费弹窗仍未出现。")
             page.screenshot(path="renew_modal_failed.png")
-            return False
+
+            # 连续3次失败：10分钟后重新执行
+            bj_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+            retry_time = bj_now + datetime.timedelta(minutes=10)
+            log(
+                f"⏰ 连续3次续费尝试失败，Cron 将在10分钟后重试："
+                f"{retry_time.strftime('%Y-%m-%d %H:%M')}（北京时间）"
+            )
+            update_cronjob_schedule(retry_time)
+
+            # 立即推送 Telegram
+            send_telegram_notification(
+                "❌ 续期失败：连续3次尝试均未打开续费弹窗，已安排10分钟后重试",
+                getattr(sys.modules[__name__], "_CURRENT_OLD_DUE", "未知"),
+                getattr(sys.modules[__name__], "_CURRENT_OLD_DUE", "未知")
+            )
+            return "RETRY_10M"
 
         handle_cloudflare(page)
-        log("🖱️ 点击 'Create Invoice'...")
-        create_btn.click()
 
+        # 真正点击 Create Invoice
+        log("🖱️ 点击 'Create Invoice'...")
+        create_btn = page.locator('button:has-text("Create Invoice"):visible').first
+        create_btn.wait_for(state="visible", timeout=10000)
+        create_btn.scroll_into_view_if_needed()
+        page.wait_for_timeout(500)
+        create_btn.click(force=True)
+
+        # 等待 Invoice 页面
         new_invoice_url = None
         start_wait = time.time()
         while time.time() - start_wait < 90:
@@ -368,9 +421,11 @@ def renew_service(page):
                 new_invoice_url = page.url
                 log(f"🎉 页面已跳转: {new_invoice_url}")
                 break
+
             if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
-                log("⚠️ 遇到拦截，尝试处理...")
+                log("⚠️ 遇到 Cloudflare 验证，尝试处理...")
                 handle_cloudflare(page)
+
             time.sleep(1)
 
         if not new_invoice_url:
@@ -378,19 +433,22 @@ def renew_service(page):
             page.screenshot(path="renew_stuck_invoice.png")
             return False
 
+        # 支付
         if page.url != new_invoice_url:
-            page.goto(new_invoice_url)
+            page.goto(new_invoice_url, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
 
         log("🔎 查找 'Pay' 按钮...")
-        pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
+        pay_btn = page.locator(
+            'a:has-text("Pay"):visible, button:has-text("Pay"):visible'
+        ).first
         pay_btn.wait_for(state="visible", timeout=30000)
-        pay_btn.click()
+        pay_btn.scroll_into_view_if_needed()
+        pay_btn.click(force=True)
         log("✅ 'Pay' 按钮已点击。")
 
-        # 等待支付确认页面或跳转回服务页
         time.sleep(5)
-        # 返回服务管理页面以获取新的到期时间
+
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
         return True
@@ -399,6 +457,7 @@ def renew_service(page):
         log(f"❌ 续费异常: {e}")
         page.screenshot(path="renew_error.png")
         return False
+
 
 def main():
     # 检查必要环境变量
@@ -447,10 +506,21 @@ def main():
             old_due = get_due_date(page)
             log(f"📆 续费前到期时间：{old_due}")
 
+            # 保存当前 Due Date，供连续3次失败时的TG通知使用
+            global _CURRENT_OLD_DUE
+            _CURRENT_OLD_DUE = old_due
+
             # 执行续费
             renew_result = renew_service(page)
 
             new_due = old_due
+            if renew_result == "RETRY_10M":
+                # renew_service() 已经完成：
+                # 1. Cron 写回10分钟后
+                # 2. Telegram 推送
+                log("🔁 已安排10分钟后重试，本次任务正常结束")
+                sys.exit(0)
+
             if renew_result == "NOT_TIME":
                 log("⏳ 未到续期时间，目前无法续期")
                 status = "⏳ 未到续期时间"
