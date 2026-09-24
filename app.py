@@ -335,7 +335,7 @@ def renew_service(page, server_id=None):
 
         modal_opened = False
 
-        for i in range(3):
+        for i in range(10):
             try:
                 # 每次尝试前重新确认页面状态
                 handle_cloudflare(page)
@@ -367,14 +367,14 @@ def renew_service(page, server_id=None):
                     log("⚠️ 弹窗未出现，准备重新加载页面后重试...")
 
                     # 第1、2次失败时重新进入服务页面，再进行下一次点击
-                    if i < 2:
+                    if i < 9:
                         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
                         handle_cloudflare(page)
                         page.wait_for_timeout(1500)
 
             except Exception as e:
                 log(f"❌ 第 {i + 1} 次点击 Renew 出错: {e}")
-                if i < 2:
+                if i < 9:
                     try:
                         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
                         handle_cloudflare(page)
@@ -383,21 +383,21 @@ def renew_service(page, server_id=None):
                         log(f"⚠️ 重载续费页面失败: {reload_error}")
 
         if not modal_opened:
-            log("❌ 错误：3次尝试后，续费弹窗仍未出现。")
+            log("❌ 错误：10次尝试后，续费弹窗仍未出现。")
             page.screenshot(path="renew_modal_failed.png")
 
-            # 连续3次失败：10分钟后重新执行
+            # 连续10次失败：10分钟后重新执行
             bj_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
             retry_time = bj_now + datetime.timedelta(minutes=10)
             log(
-                f"⏰ 连续3次续费尝试失败，Cron 将在10分钟后重试："
+                f"⏰ 连续10次续费尝试失败，Cron 将在10分钟后重试："
                 f"{retry_time.strftime('%Y-%m-%d %H:%M')}（北京时间）"
             )
             update_cronjob_schedule(retry_time)
 
             # 立即推送 Telegram
             send_telegram_notification(
-                "❌ 续期失败：连续3次尝试均未打开续费弹窗，已安排10分钟后重试",
+                "❌ 续期失败：连续10次尝试均未打开续费弹窗，已安排10分钟后重试",
                 getattr(sys.modules[__name__], "_CURRENT_OLD_DUE", "未知"),
                 getattr(sys.modules[__name__], "_CURRENT_OLD_DUE", "未知")
             )
@@ -506,7 +506,7 @@ def main():
             old_due = get_due_date(page)
             log(f"📆 续费前到期时间：{old_due}")
 
-            # 保存当前 Due Date，供连续3次失败时的TG通知使用
+            # 保存当前 Due Date，供连续10次失败时的TG通知使用
             global _CURRENT_OLD_DUE
             _CURRENT_OLD_DUE = old_due
 
