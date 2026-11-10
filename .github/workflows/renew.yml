@@ -53,6 +53,7 @@ jobs:
 
       - name: 🚀 运行续期脚本
         env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
           COOKIE_VALUE: ${{ secrets.COOKIE_VALUE }}
