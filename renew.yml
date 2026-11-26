@@ -1,0 +1,181 @@
+name: Auto Renew HidenCloud
+
+on:
+  workflow_dispatch:
+  #schedule:
+  #  - cron: '30 23 * * 0' # 根据到期时间的前一天推算星期几来续期，最后一个数字代表星期
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  renew-hiden:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+
+      - name: 📥 下载私库 app.py
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository_owner }}/Auto-Renew-HidenCloud-Private
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: private
+
+      - name: 📂 复制私库 app.py 到工作目录
+        run: cp private/app.py app.py
+
+
+      - name: ⚙ 设置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: 🛠️ 安装系统依赖和python依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb curl wget
+          pip install patchright requests 'requests[socks]' pynacl
+          python -m patchright install --with-deps chrome
+
+      - name: ⚙ 设置 GOST 代理
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          notify_proxy_failure() {
+            local reason="$1"
+            echo "❌ GOST 代理初始化失败：${reason}"
+            if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+              curl --noproxy '*' -sS --max-time 15 \
+                -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${TG_CHAT_ID}" \
+                --data-urlencode "text=🚨 HidenCloud 自动续期失败\n\n原因：GOST 代理初始化失败\n详情：${reason}\n\n已中断工作流，未执行续期操作。" \
+                >/dev/null || echo "⚠️ Telegram 故障通知发送失败"
+            else
+              echo "⚠️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，无法发送通知"
+            fi
+          }
+
+          if [ -z "$NODE_LINK" ]; then
+            notify_proxy_failure "NODE_LINK 未配置"
+            exit 1
+          fi
+
+          echo "[INFO] 下载 GOST..."
+          api_response="$(curl -fsSL --connect-timeout 10 --max-time 30 \
+            https://api.github.com/repos/ginuerzh/gost/releases/latest || true)"
+          VERSION="$(printf '%s' "$api_response" | jq -r 'if type == "object" then (.tag_name // "") else "" end' | sed 's/^v//')"
+
+          if [ -z "$VERSION" ]; then
+            notify_proxy_failure "无法从 GitHub Releases 获取有效的 GOST 版本"
+            exit 1
+          fi
+
+          echo "📦 GOST 版本: $VERSION"
+          archive="gost_${VERSION}_linux_amd64.tar.gz"
+          if ! wget -q --timeout=30 "https://github.com/ginuerzh/gost/releases/download/v${VERSION}/${archive}"; then
+            notify_proxy_failure "下载 GOST ${VERSION} 失败"
+            exit 1
+          fi
+
+          if ! tar -xzf "$archive"; then
+            notify_proxy_failure "解压 GOST 失败"
+            exit 1
+          fi
+          if [ ! -f gost ]; then
+            notify_proxy_failure "解压后未找到 GOST 可执行文件"
+            exit 1
+          fi
+
+          chmod +x gost
+          nohup ./gost -L http://127.0.0.1:8080 -F "$NODE_LINK" > gost.log 2>&1 &
+          GOST_PID=$!
+          echo "$GOST_PID" > /tmp/gost.pid
+
+          echo "[INFO] 等待 GOST 启动并验证代理出口..."
+          proxy_ok=0
+          for attempt in $(seq 1 10); do
+            if curl -fsS --max-time 10 -x http://127.0.0.1:8080 https://api.ipify.org >/tmp/proxy_ip.txt; then
+              proxy_ip="$(cat /tmp/proxy_ip.txt)"
+              if [ -n "$proxy_ip" ]; then
+                echo "✅ GOST 代理测试成功，出口 IP: $proxy_ip"
+                proxy_ok=1
+                break
+              fi
+            fi
+            sleep 3
+          done
+
+          if [ "$proxy_ok" -ne 1 ]; then
+            notify_proxy_failure "本地 HTTP 代理 127.0.0.1:8080 连通性测试失败"
+            exit 1
+          fi
+
+          # 将代理状态写入 GitHub Actions 环境，续期程序只能使用该代理
+          {
+            echo "IS_PROXY=true"
+            echo "PROXY_SERVER=http://127.0.0.1:8080"
+          } >> "$GITHUB_ENV"
+
+          echo "✅ GOST 已验证，代理环境已设置"
+
+      - name: 🚀 运行续期脚本
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          EMAIL: ${{ secrets.EMAIL }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          COOKIE_VALUE: ${{ secrets.COOKIE_VALUE }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          CRON_JOB: ${{ secrets.CRON_JOB }}
+          GH_SECRET_TOKEN: ${{ secrets.GH_SECRET_TOKEN }}
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py
+
+      # 更新时间到time.txt,避免6个月未更新导致工作流暂停
+      - name: 🕒 更新时间
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" > time.txt
+          git add time.txt
+          if git diff --cached --quiet; then
+            echo "No need to commit"
+          else
+            git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
+            git push origin main
+          fi
+      
+      - name: 🧽 清理 GOST 和临时文件
+        if: always()
+        run: |
+          if [ -f /tmp/gost.pid ]; then
+            kill "$(cat /tmp/gost.pid)" 2>/dev/null || true
+          fi
+          pkill -f "./gost -L" 2>/dev/null || true
+          rm -f gost gost_*.tar.gz gost.log /tmp/gost.pid /tmp/proxy_ip.txt
+
+      - name: 🧹 清理旧的工作流运行记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 1 ]; then
+              echo "删除运行记录: $run_id"
+              gh run delete $run_id || true
+            fi
+          done
